@@ -178,7 +178,7 @@ def light_channel(value: str) -> int:
     return channel
 
 
-def light_frame(opcode: int, payload: bytes) -> str:
+def protocol_frame(opcode: int, payload: bytes) -> str:
     frame = bytes((0xAA, opcode)) + payload
     return (frame + bytes((crc8(frame),))).hex()
 
@@ -193,12 +193,30 @@ def set_light(channel: int, rgb: str | None, brightness: int | None) -> int:
         gatt = connect_gatt(ble_mac)
         if rgb is not None:
             color = bytes.fromhex(rgb)
-            gatt.write(light_frame(0xF4, bytes((channel,)) + color + b"\x00\xff\xff\xff\xff\x00"))
+            gatt.write(protocol_frame(0xF4, bytes((channel,)) + color + b"\x00\xff\xff\xff\xff\x00"))
         if brightness is not None:
-            gatt.write(light_frame(0xF3, bytes((channel, brightness)) + b"\xff\xff\xff\xff\x00\x00"))
+            gatt.write(protocol_frame(0xF3, bytes((channel, brightness)) + b"\xff\xff\xff\xff\x00\x00"))
         return 0
     except Exception as exc:
         print(f"OpenSkelly light control failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if gatt:
+            gatt.close()
+
+
+def set_eyes(pattern: int) -> int:
+    if current_pid():
+        print("Stop microphone Live mode before changing eyes.", file=sys.stderr)
+        return 1
+    gatt: GattSession | None = None
+    try:
+        ble_mac = str(load_config()["ble_mac"])
+        gatt = connect_gatt(ble_mac)
+        gatt.write(protocol_frame(0xF9, bytes((pattern, 0)) + b"\xff\xff\xff\xff\x00"))
+        return 0
+    except Exception as exc:
+        print(f"OpenSkelly eye control failed: {exc}", file=sys.stderr)
         return 1
     finally:
         if gatt:
@@ -477,6 +495,10 @@ def main() -> int:
     brightness.add_argument("--channel", type=light_channel, default=0)
     off = light_subs.add_parser("off", help="turn a light off")
     off.add_argument("--channel", type=light_channel, default=0)
+    eyes = subs.add_parser("eyes", help="select a built-in eye pattern")
+    eye_subs = eyes.add_subparsers(dest="eyes_action", required=True)
+    eye_set = eye_subs.add_parser("set", help="select pattern 1 through 20")
+    eye_set.add_argument("pattern", type=int, choices=range(1, 21), metavar="1-20")
     args = parser.parse_args()
     action = args.action or "status"
     if action == "start":
@@ -498,6 +520,8 @@ def main() -> int:
             return set_light(args.channel, None, args.value)
         if args.lights_action == "off":
             return set_light(args.channel, None, 0)
+    if action == "eyes" and args.eyes_action == "set":
+        return set_eyes(args.pattern)
     print(f"Usage: {Path(sys.argv[0]).name} start|status|stop", file=sys.stderr)
     return 2
 

@@ -46,6 +46,17 @@ channels `0` through `5` are also accepted for compatible hardware variants;
 on the tested 12 ft. Skelly, only protocol channel `0` controlled a visible
 light. Stop microphone Live mode before changing lights.
 
+Select any of the 20 eye patterns built into Skelly's firmware:
+
+```bash
+./openskelly eyes set 1
+./openskelly eyes set 20
+```
+
+Eye artwork cannot be uploaded through the known DecorPro Bluetooth protocol;
+it only selects numbered firmware presets. Stop microphone Live mode before
+changing the eyes.
+
 To play any audio file with synchronized mouth animation:
 
 ```bash

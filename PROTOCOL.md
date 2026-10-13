@@ -32,6 +32,10 @@ Lighting commands use these opcodes:
 - `F6`: animation speed
 - `F9`: eye pattern
 
+`F9` accepts a built-in eye-pattern ID from `1` through `20`. The DecorPro app
+only transmits the numeric ID; no command for uploading custom eye artwork was
+found.
+
 The protocol provides six RGB channel numbers (`0`-`5`) plus `FF` for all.
 Testing on a 12 ft. Skelly found one visible controllable zone: channel `0` is
 the chest light. Channels `1` through `3` produced no visible change; channels
