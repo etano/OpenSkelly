@@ -155,6 +155,56 @@ def connect_gatt(ble_mac: str) -> GattSession:
     raise RuntimeError(f"could not connect to Skelly BLE control: {last_error}")
 
 
+def crc8(data: bytes) -> int:
+    """DecorPro's reflected CRC-8 (polynomial 0x8C)."""
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8C if crc & 1 else crc >> 1
+    return crc
+
+
+def light_channel(value: str) -> int:
+    aliases = {"chest": 0, "all": 0xFF}
+    if value.lower() in aliases:
+        return aliases[value.lower()]
+    try:
+        channel = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("channel must be chest, all, or 0-5") from exc
+    if not 0 <= channel <= 5:
+        raise argparse.ArgumentTypeError("channel must be chest, all, or 0-5")
+    return channel
+
+
+def light_frame(opcode: int, payload: bytes) -> str:
+    frame = bytes((0xAA, opcode)) + payload
+    return (frame + bytes((crc8(frame),))).hex()
+
+
+def set_light(channel: int, rgb: str | None, brightness: int | None) -> int:
+    if current_pid():
+        print("Stop microphone Live mode before changing lights.", file=sys.stderr)
+        return 1
+    gatt: GattSession | None = None
+    try:
+        ble_mac = str(load_config()["ble_mac"])
+        gatt = connect_gatt(ble_mac)
+        if rgb is not None:
+            color = bytes.fromhex(rgb)
+            gatt.write(light_frame(0xF4, bytes((channel,)) + color + b"\x00\xff\xff\xff\xff\x00"))
+        if brightness is not None:
+            gatt.write(light_frame(0xF3, bytes((channel, brightness)) + b"\xff\xff\xff\xff\x00\x00"))
+        return 0
+    except Exception as exc:
+        print(f"OpenSkelly light control failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if gatt:
+            gatt.close()
+
+
 def set_loopback_gain(gain: float) -> None:
     status = ""
     for _ in range(20):
@@ -416,6 +466,17 @@ def main() -> int:
     setup.add_argument("--live-mac")
     setup.add_argument("--mic-source")
     setup.add_argument("--gain", type=float, default=2.0)
+    lights = subs.add_parser("lights", help="control Skelly's RGB chest light")
+    light_subs = lights.add_subparsers(dest="lights_action", required=True)
+    color = light_subs.add_parser("color", help="set an RGB color")
+    color.add_argument("rgb", help="six-digit RGB hex value, such as ff0000")
+    color.add_argument("--channel", type=light_channel, default=0)
+    color.add_argument("--brightness", type=int, choices=range(101), default=100, metavar="0-100")
+    brightness = light_subs.add_parser("brightness", help="set light brightness")
+    brightness.add_argument("value", type=int, choices=range(101), metavar="0-100")
+    brightness.add_argument("--channel", type=light_channel, default=0)
+    off = light_subs.add_parser("off", help="turn a light off")
+    off.add_argument("--channel", type=light_channel, default=0)
     args = parser.parse_args()
     action = args.action or "status"
     if action == "start":
@@ -428,6 +489,15 @@ def main() -> int:
         return configure(args)
     if action == "play":
         return play_audio(args.audio)
+    if action == "lights":
+        if args.lights_action == "color":
+            if not re.fullmatch(r"[0-9a-fA-F]{6}", args.rgb):
+                parser.error("RGB color must be exactly six hexadecimal digits")
+            return set_light(args.channel, args.rgb, args.brightness)
+        if args.lights_action == "brightness":
+            return set_light(args.channel, None, args.value)
+        if args.lights_action == "off":
+            return set_light(args.channel, None, 0)
     print(f"Usage: {Path(sys.argv[0]).name} start|status|stop", file=sys.stderr)
     return 2
 

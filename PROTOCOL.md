@@ -24,6 +24,19 @@ Live-mode sequence:
 Pairing credentials are intentionally not included. Device addresses are unique
 and are discovered during `openskelly configure`.
 
+Lighting commands use these opcodes:
+
+- `F3`: brightness (`0`-`100`)
+- `F4`: RGB color
+- `F5`: selected channel
+- `F6`: animation speed
+- `F9`: eye pattern
+
+The protocol provides six RGB channel numbers (`0`-`5`) plus `FF` for all.
+Testing on a 12 ft. Skelly found one visible controllable zone: channel `0` is
+the chest light. Channels `1` through `3` produced no visible change; channels
+`4` and `5` remain untested.
+
 The tested hardware required SBC at 44.1 kHz. At 48 kHz the transport appeared
 active but produced no audio. Audio also needs sufficient signal level to cross
 the mouth-animation threshold.

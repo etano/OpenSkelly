@@ -31,6 +31,21 @@ If discovery fails, use `configure --ble-mac AA:... --live-mac BB:...`.
 ./openskelly stop
 ```
 
+Control the RGB chest light with a six-digit hex color or brightness from 0 to
+100:
+
+```bash
+./openskelly lights color ff0000
+./openskelly lights color 8000ff --brightness 50
+./openskelly lights brightness 25
+./openskelly lights off
+```
+
+The friendly channel name `chest` is the default. `--channel all` and numeric
+channels `0` through `5` are also accepted for compatible hardware variants;
+on the tested 12 ft. Skelly, only protocol channel `0` controlled a visible
+light. Stop microphone Live mode before changing lights.
+
 To play any audio file with synchronized mouth animation:
 
 ```bash
