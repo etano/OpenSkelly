@@ -31,6 +31,19 @@ If discovery fails, use `configure --ble-mac AA:... --live-mac BB:...`.
 ./openskelly stop
 ```
 
+To play any audio file with synchronized mouth animation:
+
+```bash
+./openskelly play speech.wav
+```
+
+OpenSkelly accepts any format supported by FFmpeg. It normalizes and converts
+the input to 44.1 kHz stereo, adds a short lead-in so Bluetooth connection
+sounds do not overlap playback, animates the mouth, and disconnects afterward.
+This keeps OpenSkelly independent of any particular TTS engine; generate the
+audio with your preferred voice system first. Stop microphone Live mode before
+using `play`.
+
 Disconnect `12ft Skelly(Live)` from phones first. Only one audio source can own
 the classic-Bluetooth connection at a time.
 

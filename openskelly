@@ -12,6 +12,7 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -298,6 +299,65 @@ def status() -> int:
     return 1
 
 
+def prepare_audio(source: Path, output: Path) -> None:
+    if not source.is_file():
+        raise RuntimeError(f"audio file not found: {source}")
+    run_checked(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source), "-af",
+        "loudnorm=I=-10:TP=-1:LRA=11,adelay=2000|2000,apad=pad_dur=0.75",
+        "-ar", "44100", "-ac", "2", str(output), timeout=60,
+    )
+
+
+def play_audio(source: Path) -> int:
+    if current_pid():
+        print("Stop microphone Live mode before using 'say'.", file=sys.stderr)
+        return 1
+    gatt: GattSession | None = None
+    try:
+        config = load_config()
+        ble_mac = str(config["ble_mac"])
+        live_mac = str(config["live_mac"])
+        with tempfile.TemporaryDirectory(prefix="openskelly-") as temp:
+            speech = Path(temp) / "prepared.wav"
+            print("Preparing audio…", flush=True)
+            prepare_audio(source, speech)
+            gatt = connect_gatt(ble_mac)
+            gatt.write(COMMANDS["stop_file"])
+            gatt.write(COMMANDS["enable_live_radio"], "bb fd 01")
+            result = run_checked("bluetoothctl", "connect", live_mac)
+            if "Connection successful" not in result.stdout and "already connected" not in result.stdout.lower():
+                raise RuntimeError(result.stdout.strip())
+            gatt.write(COMMANDS["select_bluetooth"], "bb fe 01")
+            player = subprocess.Popen([
+                "pw-play", "--target", sink_name(live_mac), "--volume", "1.0", str(speech)
+            ])
+            time.sleep(0.3)
+            gatt.write(COMMANDS["start_live"])
+            time.sleep(0.08)
+            gatt.write(COMMANDS["volume_100"])
+            if player.wait(timeout=120) != 0:
+                raise RuntimeError("speech playback failed")
+        return 0
+    except Exception as exc:
+        print(f"OpenSkelly playback failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if gatt:
+            try:
+                gatt.write(COMMANDS["stop_live"])
+            except Exception:
+                pass
+        try:
+            if "live_mac" in locals():
+                run_checked("bluetoothctl", "disconnect", live_mac, timeout=10)
+        except Exception:
+            pass
+        if gatt:
+            gatt.close()
+
+
 def bluetooth_devices() -> list[tuple[str, str]]:
     output = run_checked("bluetoothctl", "devices").stdout
     devices = []
@@ -349,6 +409,8 @@ def main() -> int:
     subs.add_parser("start")
     subs.add_parser("stop")
     subs.add_parser("status")
+    play_parser = subs.add_parser("play", help="play an audio file with synchronized animation")
+    play_parser.add_argument("audio", type=Path)
     setup = subs.add_parser("configure")
     setup.add_argument("--ble-mac")
     setup.add_argument("--live-mac")
@@ -364,6 +426,8 @@ def main() -> int:
         return status()
     if action == "configure":
         return configure(args)
+    if action == "play":
+        return play_audio(args.audio)
     print(f"Usage: {Path(sys.argv[0]).name} start|status|stop", file=sys.stderr)
     return 2
 
