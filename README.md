@@ -88,6 +88,12 @@ compatibility player. The default 2x microphone gain matches DecorPro.
 
 Runtime state and logs are stored under `.skelly-live/`.
 
+Run the offline protocol and routing checks with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 See [PROTOCOL.md](PROTOCOL.md) for reverse-engineered protocol details.
 
 OpenSkelly is independent and is not affiliated with or endorsed by Home Depot

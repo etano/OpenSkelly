@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start and stop 12ft Skelly live microphone mode."""
+"""Control 12ft Skelly lighting, eyes, Live audio, and system audio output."""
 
 from __future__ import annotations
 
@@ -80,6 +80,7 @@ class GattSession:
         )
         os.close(slave)
         self.buffer = ""
+        self.closed = False
 
     def send(self, line: str) -> None:
         os.write(self.master, (line + "\n").encode())
@@ -114,13 +115,23 @@ class GattSession:
             time.sleep(0.12)
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
         if self.proc.poll() is None:
             try:
                 self.send("exit")
                 self.proc.wait(timeout=2)
             except Exception:
                 self.proc.terminate()
-        os.close(self.master)
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
 
 
 def run_checked(*args: str, timeout: float = 20) -> subprocess.CompletedProcess[str]:
@@ -253,6 +264,15 @@ def restore_default_sink(previous: str | None) -> None:
             pass
 
 
+def spotify_sink_input_ids(output: str) -> list[str]:
+    ids = []
+    for block in re.split(r"(?=Sink Input #)", output):
+        number = re.search(r"^Sink Input #(\d+)", block)
+        if number and 'application.process.binary = "spotifyd"' in block:
+            ids.append(number.group(1))
+    return ids
+
+
 def route_spotify_direct(live_mac: str) -> None:
     target = sink_name(live_mac)
     for _ in range(30):
@@ -264,10 +284,8 @@ def route_spotify_direct(live_mac: str) -> None:
         raise RuntimeError("Skelly connected, but its audio sink did not appear")
     run_checked("pactl", "set-default-sink", target)
     inputs = run_checked("pactl", "list", "sink-inputs").stdout
-    for block in re.split(r"(?=Sink Input #)", inputs):
-        number = re.search(r"^Sink Input #(\d+)", block)
-        if number and 'application.process.binary = "spotifyd"' in block:
-            run_checked("pactl", "move-sink-input", number.group(1), target)
+    for input_id in spotify_sink_input_ids(inputs):
+        run_checked("pactl", "move-sink-input", input_id, target)
 
 
 def stop_process(proc: subprocess.Popen[bytes] | None) -> None:
@@ -280,43 +298,31 @@ def stop_process(proc: subprocess.Popen[bytes] | None) -> None:
         proc.kill()
 
 
-def start_audio_bridge(mode: str, live_mac: str, mic_source: str, gain: float) -> subprocess.Popen[bytes]:
-    if mode == "output":
-        proc = subprocess.Popen(
-            [
-                "pw-loopback", "--name", "skelly-output-keepalive", "--channels", "2",
-                "--channel-map", "[ FL, FR ]", "--latency", "100",
-                "--capture", "openskelly_bus.monitor", "--playback", sink_name(live_mac),
-                "--capture-props", "{ audio.rate = 44100 audio.format = S16LE }",
-                "--playback-props", "{ audio.rate = 44100 audio.format = S16LE }",
-            ]
-        )
-    else:
-        proc = subprocess.Popen(
-            [
-                "pw-loopback", "--name", "skelly-live-mic", "--channels", "2",
-                "--channel-map", "[ FL, FR ]", "--latency", "100",
-                "--capture", mic_source, "--playback", sink_name(live_mac),
-                "--capture-props", "{ audio.rate = 44100 audio.format = S16LE }",
-                "--playback-props", "{ audio.rate = 44100 audio.format = S16LE }",
-            ]
-        )
+def start_microphone_bridge(live_mac: str, mic_source: str, gain: float) -> subprocess.Popen[bytes]:
+    proc = subprocess.Popen(
+        [
+            "pw-loopback", "--name", "skelly-live-mic", "--channels", "2",
+            "--channel-map", "[ FL, FR ]", "--latency", "100",
+            "--capture", mic_source, "--playback", sink_name(live_mac),
+            "--capture-props", "{ audio.rate = 44100 audio.format = S16LE }",
+            "--playback-props", "{ audio.rate = 44100 audio.format = S16LE }",
+        ]
+    )
     time.sleep(0.5)
     if proc.poll() is not None:
-        raise RuntimeError(f"Skelly {mode} audio bridge failed to start")
+        raise RuntimeError("Skelly microphone bridge failed to start")
     try:
-        if mode == "mic":
-            set_loopback_gain(gain)
+        set_loopback_gain(gain)
     except Exception:
         stop_process(proc)
         raise
     return proc
 
 
-def connect_live(gatt: GattSession, live_mac: str, wait_for_ack: bool = True) -> None:
+def connect_live(gatt: GattSession, live_mac: str) -> None:
     gatt.write(COMMANDS["stop_file"])
     gatt.write(COMMANDS["stop_live"])
-    gatt.write(COMMANDS["enable_live_radio"], "bb fd 01" if wait_for_ack else None)
+    gatt.write(COMMANDS["enable_live_radio"], "bb fd 01")
     last_output = ""
     for _ in range(4):
         result = subprocess.run(
@@ -330,7 +336,30 @@ def connect_live(gatt: GattSession, live_mac: str, wait_for_ack: bool = True) ->
         gatt.write(COMMANDS["enable_live_radio"])
     else:
         raise RuntimeError(f"could not connect Skelly audio: {last_output}")
-    gatt.write(COMMANDS["select_bluetooth"], "bb fe 01" if wait_for_ack else None)
+    gatt.write(COMMANDS["select_bluetooth"], "bb fe 01")
+
+
+def activate_mode(
+    gatt: GattSession,
+    mode: str,
+    live_mac: str,
+    mic_source: str,
+    gain: float,
+) -> subprocess.Popen[bytes] | None:
+    connect_live(gatt, live_mac)
+    bridge = None
+    if mode == "output":
+        route_spotify_direct(live_mac)
+    else:
+        bridge = start_microphone_bridge(live_mac, mic_source, gain)
+    try:
+        gatt.write(COMMANDS["start_live"])
+        time.sleep(0.08)
+        gatt.write(COMMANDS["volume_100"])
+    except Exception:
+        stop_process(bridge)
+        raise
+    return bridge
 
 
 def daemon(mode: str = "mic") -> int:
@@ -357,14 +386,7 @@ def daemon(mode: str = "mic") -> int:
         if mode == "output":
             previous_sink = run_checked("pactl", "get-default-sink").stdout.strip()
         gatt = connect_gatt(ble_mac)
-        connect_live(gatt, live_mac)
-        if mode == "output":
-            route_spotify_direct(live_mac)
-        else:
-            audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
-        gatt.write(COMMANDS["start_live"])
-        time.sleep(0.08)
-        gatt.write(COMMANDS["volume_100"])
+        audio_bridge = activate_mode(gatt, mode, live_mac, mic_source, gain)
         print(f"Skelly {mode} mode is running", flush=True)
 
         while not stop_requested:
@@ -381,13 +403,7 @@ def daemon(mode: str = "mic") -> int:
                         except Exception:
                             pass
                         gatt = connect_gatt(ble_mac)
-                        connect_live(gatt, live_mac)
-                        if mode == "output":
-                            route_spotify_direct(live_mac)
-                        else:
-                            audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
-                        gatt.write(COMMANDS["start_live"])
-                        gatt.write(COMMANDS["volume_100"])
+                        audio_bridge = activate_mode(gatt, mode, live_mac, mic_source, gain)
                         print("Skelly audio reconnected", flush=True)
                         reconnected = True
                         break
@@ -487,7 +503,7 @@ def prepare_audio(source: Path, output: Path) -> None:
 
 def play_audio(source: Path) -> int:
     if current_pid():
-        print("Stop microphone Live mode before using 'say'.", file=sys.stderr)
+        print("Stop Live mode before using 'play'.", file=sys.stderr)
         return 1
     gatt: GattSession | None = None
     try:
