@@ -31,9 +31,9 @@ If discovery fails, use `configure --ble-mac AA:... --live-mac BB:...`.
 ./openskelly stop
 ```
 
-To route music or other system audio to Skelly, use output mode. It creates a
-private 44.1 kHz audio bus with one continuous A2DP stream and automatically
-restores the Live handshake and route after a Bluetooth drop:
+To route Spotify or other system audio to Skelly, use output mode. It selects
+Skelly as the default output, moves an existing Spotify stream directly to it,
+and automatically restores the Live handshake and route after a Bluetooth drop:
 
 ```bash
 ./openskelly output start

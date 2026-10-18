@@ -245,32 +245,29 @@ def bluetooth_connected(mac: str) -> bool:
     return bool(re.search(r"^\s*Connected:\s+yes\s*$", output, re.MULTILINE))
 
 
-def create_output_bus() -> tuple[str, str]:
-    previous = run_checked("pactl", "get-default-sink").stdout.strip()
-    module = run_checked(
-        "pactl", "load-module", "module-null-sink", "sink_name=openskelly_bus",
-        "rate=44100", "channels=2",
-    ).stdout.strip()
-    run_checked("pactl", "set-default-sink", "openskelly_bus")
-    inputs = run_checked("pactl", "list", "sink-inputs").stdout
-    for block in re.split(r"(?=Sink Input #)", inputs):
-        number = re.search(r"^Sink Input #(\d+)", block)
-        if number and 'application.process.binary = "spotifyd"' in block:
-            run_checked("pactl", "move-sink-input", number.group(1), "openskelly_bus")
-    return module, previous
-
-
-def remove_output_bus(module: str | None, previous: str | None) -> None:
+def restore_default_sink(previous: str | None) -> None:
     if previous:
         try:
             run_checked("pactl", "set-default-sink", previous)
         except Exception:
             pass
-    if module:
-        try:
-            run_checked("pactl", "unload-module", module)
-        except Exception:
-            pass
+
+
+def route_spotify_direct(live_mac: str) -> None:
+    target = sink_name(live_mac)
+    for _ in range(30):
+        sinks = run_checked("pactl", "list", "sinks", "short").stdout
+        if target in sinks:
+            break
+        time.sleep(0.2)
+    else:
+        raise RuntimeError("Skelly connected, but its audio sink did not appear")
+    run_checked("pactl", "set-default-sink", target)
+    inputs = run_checked("pactl", "list", "sink-inputs").stdout
+    for block in re.split(r"(?=Sink Input #)", inputs):
+        number = re.search(r"^Sink Input #(\d+)", block)
+        if number and 'application.process.binary = "spotifyd"' in block:
+            run_checked("pactl", "move-sink-input", number.group(1), target)
 
 
 def stop_process(proc: subprocess.Popen[bytes] | None) -> None:
@@ -350,7 +347,6 @@ def daemon(mode: str = "mic") -> int:
     signal.signal(signal.SIGINT, request_stop)
     gatt: GattSession | None = None
     audio_bridge: subprocess.Popen[bytes] | None = None
-    output_module: str | None = None
     previous_sink: str | None = None
     try:
         config = load_config()
@@ -359,20 +355,25 @@ def daemon(mode: str = "mic") -> int:
         mic_source = str(config["mic_source"])
         gain = float(config["gain"])
         if mode == "output":
-            output_module, previous_sink = create_output_bus()
+            previous_sink = run_checked("pactl", "get-default-sink").stdout.strip()
         gatt = connect_gatt(ble_mac)
         connect_live(gatt, live_mac)
-        audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
+        if mode == "output":
+            route_spotify_direct(live_mac)
+        else:
+            audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
         gatt.write(COMMANDS["start_live"])
         time.sleep(0.08)
         gatt.write(COMMANDS["volume_100"])
         print(f"Skelly {mode} mode is running", flush=True)
 
         while not stop_requested:
-            if audio_bridge.poll() is not None or not bluetooth_connected(live_mac):
+            bridge_failed = audio_bridge is not None and audio_bridge.poll() is not None
+            if bridge_failed or not bluetooth_connected(live_mac):
                 print("Skelly audio disconnected; reconnecting…", flush=True)
                 stop_process(audio_bridge)
                 audio_bridge = None
+                reconnected = False
                 for attempt in range(1, 6):
                     try:
                         try:
@@ -381,15 +382,19 @@ def daemon(mode: str = "mic") -> int:
                             pass
                         gatt = connect_gatt(ble_mac)
                         connect_live(gatt, live_mac)
-                        audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
+                        if mode == "output":
+                            route_spotify_direct(live_mac)
+                        else:
+                            audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
                         gatt.write(COMMANDS["start_live"])
                         gatt.write(COMMANDS["volume_100"])
                         print("Skelly audio reconnected", flush=True)
+                        reconnected = True
                         break
                     except Exception as exc:
                         print(f"Reconnect attempt {attempt} failed: {exc}", flush=True)
                         time.sleep(min(attempt * 2, 8))
-                if audio_bridge is None:
+                if not reconnected:
                     raise RuntimeError("could not restore Skelly audio after five attempts")
             time.sleep(2)
         return 0
@@ -403,7 +408,7 @@ def daemon(mode: str = "mic") -> int:
             except Exception:
                 pass
         stop_process(audio_bridge)
-        remove_output_bus(output_module, previous_sink)
+        restore_default_sink(previous_sink)
         try:
             if "live_mac" in locals():
                 run_checked("bluetoothctl", "disconnect", live_mac, timeout=10)
