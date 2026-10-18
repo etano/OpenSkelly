@@ -7,7 +7,7 @@ microphone to `12ft Skelly(Live)` with speech-driven mouth movement.
 ## Requirements
 
 Linux with BlueZ, PipeWire, WirePlumber, `bluetoothctl`, `gatttool`,
-`pw-loopback`, and `wpctl`.
+`pw-loopback`, `pactl`, and `wpctl`.
 
 ## Setup
 
@@ -29,6 +29,16 @@ If discovery fails, use `configure --ble-mac AA:... --live-mac BB:...`.
 ./openskelly start
 ./openskelly status
 ./openskelly stop
+```
+
+To route music or other system audio to Skelly, use output mode. It creates a
+private 44.1 kHz audio bus with one continuous A2DP stream and automatically
+restores the Live handshake and route after a Bluetooth drop:
+
+```bash
+./openskelly output start
+./openskelly output status
+./openskelly output stop
 ```
 
 Control the RGB chest light with a six-digit hex color or brightness from 0 to

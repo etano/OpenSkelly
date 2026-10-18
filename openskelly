@@ -30,6 +30,7 @@ COMMANDS = {
 ROOT = Path(__file__).resolve().parent
 RUNTIME = ROOT / ".skelly-live"
 PID_FILE = RUNTIME / "pid"
+MODE_FILE = RUNTIME / "mode"
 LOG_FILE = RUNTIME / "skelly-live.log"
 CONFIG_FILE = Path.home() / ".config" / "openskelly" / "config.json"
 
@@ -236,9 +237,108 @@ def set_loopback_gain(gain: float) -> None:
     raise RuntimeError(f"microphone bridge appeared, but its gain control was not found:\n{names}")
 
 
-def daemon() -> int:
+def bluetooth_connected(mac: str) -> bool:
+    try:
+        output = run_checked("bluetoothctl", "info", mac, timeout=5).stdout
+    except Exception:
+        return False
+    return bool(re.search(r"^\s*Connected:\s+yes\s*$", output, re.MULTILINE))
+
+
+def create_output_bus() -> tuple[str, str]:
+    previous = run_checked("pactl", "get-default-sink").stdout.strip()
+    module = run_checked(
+        "pactl", "load-module", "module-null-sink", "sink_name=openskelly_bus",
+        "rate=44100", "channels=2",
+    ).stdout.strip()
+    run_checked("pactl", "set-default-sink", "openskelly_bus")
+    inputs = run_checked("pactl", "list", "sink-inputs").stdout
+    for block in re.split(r"(?=Sink Input #)", inputs):
+        number = re.search(r"^Sink Input #(\d+)", block)
+        if number and 'application.process.binary = "spotifyd"' in block:
+            run_checked("pactl", "move-sink-input", number.group(1), "openskelly_bus")
+    return module, previous
+
+
+def remove_output_bus(module: str | None, previous: str | None) -> None:
+    if previous:
+        try:
+            run_checked("pactl", "set-default-sink", previous)
+        except Exception:
+            pass
+    if module:
+        try:
+            run_checked("pactl", "unload-module", module)
+        except Exception:
+            pass
+
+
+def stop_process(proc: subprocess.Popen[bytes] | None) -> None:
+    if not proc or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def start_audio_bridge(mode: str, live_mac: str, mic_source: str, gain: float) -> subprocess.Popen[bytes]:
+    if mode == "output":
+        proc = subprocess.Popen(
+            [
+                "pw-loopback", "--name", "skelly-output-keepalive", "--channels", "2",
+                "--channel-map", "[ FL, FR ]", "--latency", "100",
+                "--capture", "openskelly_bus.monitor", "--playback", sink_name(live_mac),
+                "--capture-props", "{ audio.rate = 44100 audio.format = S16LE }",
+                "--playback-props", "{ audio.rate = 44100 audio.format = S16LE }",
+            ]
+        )
+    else:
+        proc = subprocess.Popen(
+            [
+                "pw-loopback", "--name", "skelly-live-mic", "--channels", "2",
+                "--channel-map", "[ FL, FR ]", "--latency", "100",
+                "--capture", mic_source, "--playback", sink_name(live_mac),
+                "--capture-props", "{ audio.rate = 44100 audio.format = S16LE }",
+                "--playback-props", "{ audio.rate = 44100 audio.format = S16LE }",
+            ]
+        )
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        raise RuntimeError(f"Skelly {mode} audio bridge failed to start")
+    try:
+        if mode == "mic":
+            set_loopback_gain(gain)
+    except Exception:
+        stop_process(proc)
+        raise
+    return proc
+
+
+def connect_live(gatt: GattSession, live_mac: str) -> None:
+    gatt.write(COMMANDS["stop_file"])
+    gatt.write(COMMANDS["enable_live_radio"])
+    last_output = ""
+    for _ in range(4):
+        result = subprocess.run(
+            ["bluetoothctl", "connect", live_mac], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15,
+        )
+        last_output = result.stdout.strip()
+        if bluetooth_connected(live_mac):
+            break
+        time.sleep(1)
+        gatt.write(COMMANDS["enable_live_radio"])
+    else:
+        raise RuntimeError(f"could not connect Skelly audio: {last_output}")
+    gatt.write(COMMANDS["select_bluetooth"])
+
+
+def daemon(mode: str = "mic") -> int:
     RUNTIME.mkdir(exist_ok=True)
     PID_FILE.write_text(f"{os.getpid()}\n")
+    MODE_FILE.write_text(f"{mode}\n")
     stop_requested = False
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -248,48 +348,47 @@ def daemon() -> int:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     gatt: GattSession | None = None
-    loopback: subprocess.Popen[bytes] | None = None
+    audio_bridge: subprocess.Popen[bytes] | None = None
+    output_module: str | None = None
+    previous_sink: str | None = None
     try:
         config = load_config()
         ble_mac = str(config["ble_mac"])
         live_mac = str(config["live_mac"])
         mic_source = str(config["mic_source"])
         gain = float(config["gain"])
+        if mode == "output":
+            output_module, previous_sink = create_output_bus()
         gatt = connect_gatt(ble_mac)
-        gatt.write(COMMANDS["stop_file"])
-        gatt.write(COMMANDS["enable_live_radio"], "bb fd 01")
-
-        result = run_checked("bluetoothctl", "connect", live_mac)
-        if "Connection successful" not in result.stdout and "already connected" not in result.stdout.lower():
-            raise RuntimeError(result.stdout.strip())
-
-        gatt.write(COMMANDS["select_bluetooth"], "bb fe 01")
-        loopback = subprocess.Popen(
-            [
-                "pw-loopback",
-                "--name", "skelly-live-mic",
-                "--channels", "2",
-                "--channel-map", "[ FL, FR ]",
-                "--latency", "100",
-                "--capture", mic_source,
-                "--playback", sink_name(live_mac),
-                "--capture-props", "{ audio.rate = 44100 audio.format = S16LE }",
-                "--playback-props", "{ audio.rate = 44100 audio.format = S16LE }",
-            ]
-        )
-        time.sleep(0.5)
-        if loopback.poll() is not None:
-            raise RuntimeError("microphone bridge failed to start")
-        set_loopback_gain(gain)
+        connect_live(gatt, live_mac)
+        audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
         gatt.write(COMMANDS["start_live"])
         time.sleep(0.08)
         gatt.write(COMMANDS["volume_100"])
-        print("Skelly Live is running", flush=True)
+        print(f"Skelly {mode} mode is running", flush=True)
 
         while not stop_requested:
-            if loopback.poll() is not None:
-                raise RuntimeError("microphone bridge stopped unexpectedly")
-            time.sleep(0.5)
+            if audio_bridge.poll() is not None or not bluetooth_connected(live_mac):
+                print("Skelly audio disconnected; reconnecting…", flush=True)
+                stop_process(audio_bridge)
+                audio_bridge = None
+                for attempt in range(1, 6):
+                    try:
+                        if gatt.proc.poll() is not None:
+                            gatt.close()
+                            gatt = connect_gatt(ble_mac)
+                        connect_live(gatt, live_mac)
+                        audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
+                        gatt.write(COMMANDS["start_live"])
+                        gatt.write(COMMANDS["volume_100"])
+                        print("Skelly audio reconnected", flush=True)
+                        break
+                    except Exception as exc:
+                        print(f"Reconnect attempt {attempt} failed: {exc}", flush=True)
+                        time.sleep(min(attempt * 2, 8))
+                if audio_bridge is None:
+                    raise RuntimeError("could not restore Skelly audio after five attempts")
+            time.sleep(2)
         return 0
     except Exception as exc:
         print(f"Skelly Live failed: {exc}", file=sys.stderr, flush=True)
@@ -300,12 +399,8 @@ def daemon() -> int:
                 gatt.write(COMMANDS["stop_live"])
             except Exception:
                 pass
-        if loopback and loopback.poll() is None:
-            loopback.terminate()
-            try:
-                loopback.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                loopback.kill()
+        stop_process(audio_bridge)
+        remove_output_bus(output_module, previous_sink)
         try:
             if "live_mac" in locals():
                 run_checked("bluetoothctl", "disconnect", live_mac, timeout=10)
@@ -314,16 +409,17 @@ def daemon() -> int:
         if gatt:
             gatt.close()
         PID_FILE.unlink(missing_ok=True)
+        MODE_FILE.unlink(missing_ok=True)
 
 
-def start() -> int:
+def start(mode: str = "mic") -> int:
     if pid := current_pid():
         print(f"Skelly Live is already running (PID {pid})")
         return 0
     RUNTIME.mkdir(exist_ok=True)
     with LOG_FILE.open("wb", buffering=0) as log:
         proc = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "_run"],
+            [sys.executable, str(Path(__file__).resolve()), "_run", mode],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
@@ -333,8 +429,8 @@ def start() -> int:
         time.sleep(0.25)
         if current_pid() == proc.pid:
             text = LOG_FILE.read_text(errors="replace")
-            if "Skelly Live is running" in text:
-                print(f"Skelly Live started (PID {proc.pid})")
+            if f"Skelly {mode} mode is running" in text:
+                print(f"Skelly {mode} mode started (PID {proc.pid})")
                 return 0
         if proc.poll() is not None:
             print(LOG_FILE.read_text(errors="replace").rstrip(), file=sys.stderr)
@@ -361,8 +457,11 @@ def stop() -> int:
 
 def status() -> int:
     if pid := current_pid():
-        print(f"Skelly Live is running (PID {pid})")
-        return 0
+        mode = MODE_FILE.read_text().strip() if MODE_FILE.exists() else "mic"
+        connected = bluetooth_connected(str(load_config()["live_mac"]))
+        state = "connected" if connected else "reconnecting"
+        print(f"Skelly {mode} mode is running (PID {pid}, {state})")
+        return 0 if connected else 1
     print("Skelly Live is stopped")
     return 1
 
@@ -471,12 +570,14 @@ def configure(args: argparse.Namespace) -> int:
 
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "_run":
-        return daemon()
+        return daemon(sys.argv[2] if len(sys.argv) > 2 else "mic")
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="action")
     subs.add_parser("start")
     subs.add_parser("stop")
     subs.add_parser("status")
+    output = subs.add_parser("output", help="route system audio with automatic reconnect")
+    output.add_argument("output_action", choices=("start", "status", "stop"))
     play_parser = subs.add_parser("play", help="play an audio file with synchronized animation")
     play_parser.add_argument("audio", type=Path)
     setup = subs.add_parser("configure")
@@ -511,6 +612,12 @@ def main() -> int:
         return configure(args)
     if action == "play":
         return play_audio(args.audio)
+    if action == "output":
+        if args.output_action == "start":
+            return start("output")
+        if args.output_action == "status":
+            return status()
+        return stop()
     if action == "lights":
         if args.lights_action == "color":
             if not re.fullmatch(r"[0-9a-fA-F]{6}", args.rgb):
