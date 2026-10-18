@@ -316,9 +316,10 @@ def start_audio_bridge(mode: str, live_mac: str, mic_source: str, gain: float) -
     return proc
 
 
-def connect_live(gatt: GattSession, live_mac: str) -> None:
+def connect_live(gatt: GattSession, live_mac: str, wait_for_ack: bool = True) -> None:
     gatt.write(COMMANDS["stop_file"])
-    gatt.write(COMMANDS["enable_live_radio"])
+    gatt.write(COMMANDS["stop_live"])
+    gatt.write(COMMANDS["enable_live_radio"], "bb fd 01" if wait_for_ack else None)
     last_output = ""
     for _ in range(4):
         result = subprocess.run(
@@ -332,7 +333,7 @@ def connect_live(gatt: GattSession, live_mac: str) -> None:
         gatt.write(COMMANDS["enable_live_radio"])
     else:
         raise RuntimeError(f"could not connect Skelly audio: {last_output}")
-    gatt.write(COMMANDS["select_bluetooth"])
+    gatt.write(COMMANDS["select_bluetooth"], "bb fe 01" if wait_for_ack else None)
 
 
 def daemon(mode: str = "mic") -> int:
@@ -374,9 +375,11 @@ def daemon(mode: str = "mic") -> int:
                 audio_bridge = None
                 for attempt in range(1, 6):
                     try:
-                        if gatt.proc.poll() is not None:
+                        try:
                             gatt.close()
-                            gatt = connect_gatt(ble_mac)
+                        except Exception:
+                            pass
+                        gatt = connect_gatt(ble_mac)
                         connect_live(gatt, live_mac)
                         audio_bridge = start_audio_bridge(mode, live_mac, mic_source, gain)
                         gatt.write(COMMANDS["start_live"])
