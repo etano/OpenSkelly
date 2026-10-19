@@ -10,6 +10,7 @@ import pty
 import re
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,7 @@ RUNTIME = ROOT / ".skelly-live"
 PID_FILE = RUNTIME / "pid"
 MODE_FILE = RUNTIME / "mode"
 LOG_FILE = RUNTIME / "skelly-live.log"
+CONTROL_SOCKET = RUNTIME / "control.sock"
 CONFIG_FILE = Path.home() / ".config" / "openskelly" / "config.json"
 
 
@@ -195,19 +197,41 @@ def protocol_frame(opcode: int, payload: bytes) -> str:
     return (frame + bytes((crc8(frame),))).hex()
 
 
+def send_live_frames(frames: list[str]) -> None:
+    deadline = time.monotonic() + 8
+    while True:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(3)
+        try:
+            client.connect(str(CONTROL_SOCKET))
+            client.sendall(json.dumps({"frames": frames}).encode() + b"\n")
+            response = json.loads(client.recv(4096))
+            if not response.get("ok"):
+                raise RuntimeError(response.get("error", "Live control failed"))
+            return
+        except (FileNotFoundError, ConnectionRefusedError):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Live control socket is unavailable")
+            time.sleep(0.2)
+        finally:
+            client.close()
+
+
 def set_light(channel: int, rgb: str | None, brightness: int | None) -> int:
-    if current_pid():
-        print("Stop microphone Live mode before changing lights.", file=sys.stderr)
-        return 1
+    frames = []
+    if rgb is not None:
+        frames.append(protocol_frame(0xF4, bytes((channel,)) + bytes.fromhex(rgb) + b"\x00\xff\xff\xff\xff\x00"))
+    if brightness is not None:
+        frames.append(protocol_frame(0xF3, bytes((channel, brightness)) + b"\xff\xff\xff\xff\x00\x00"))
     gatt: GattSession | None = None
     try:
+        if current_pid():
+            send_live_frames(frames)
+            return 0
         ble_mac = str(load_config()["ble_mac"])
         gatt = connect_gatt(ble_mac)
-        if rgb is not None:
-            color = bytes.fromhex(rgb)
-            gatt.write(protocol_frame(0xF4, bytes((channel,)) + color + b"\x00\xff\xff\xff\xff\x00"))
-        if brightness is not None:
-            gatt.write(protocol_frame(0xF3, bytes((channel, brightness)) + b"\xff\xff\xff\xff\x00\x00"))
+        for frame in frames:
+            gatt.write(frame)
         return 0
     except Exception as exc:
         print(f"OpenSkelly light control failed: {exc}", file=sys.stderr)
@@ -218,14 +242,15 @@ def set_light(channel: int, rgb: str | None, brightness: int | None) -> int:
 
 
 def set_eyes(pattern: int) -> int:
-    if current_pid():
-        print("Stop microphone Live mode before changing eyes.", file=sys.stderr)
-        return 1
+    frame = protocol_frame(0xF9, bytes((pattern, 0)) + b"\xff\xff\xff\xff\x00")
     gatt: GattSession | None = None
     try:
+        if current_pid():
+            send_live_frames([frame])
+            return 0
         ble_mac = str(load_config()["ble_mac"])
         gatt = connect_gatt(ble_mac)
-        gatt.write(protocol_frame(0xF9, bytes((pattern, 0)) + b"\xff\xff\xff\xff\x00"))
+        gatt.write(frame)
         return 0
     except Exception as exc:
         print(f"OpenSkelly eye control failed: {exc}", file=sys.stderr)
@@ -362,6 +387,38 @@ def activate_mode(
     return bridge
 
 
+def open_control_socket() -> socket.socket:
+    CONTROL_SOCKET.unlink(missing_ok=True)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(CONTROL_SOCKET))
+    os.chmod(CONTROL_SOCKET, 0o600)
+    listener.listen(2)
+    listener.settimeout(2)
+    return listener
+
+
+def serve_control(listener: socket.socket, gatt: GattSession) -> None:
+    try:
+        client, _ = listener.accept()
+    except TimeoutError:
+        return
+    with client:
+        try:
+            request = json.loads(client.recv(4096))
+            frames = request.get("frames")
+            if not isinstance(frames, list) or not frames or not all(
+                isinstance(frame, str) and re.fullmatch(r"[0-9a-f]{22,26}", frame)
+                for frame in frames
+            ):
+                raise ValueError("invalid control request")
+            for frame in frames:
+                gatt.write(frame)
+            response = {"ok": True}
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+        client.sendall(json.dumps(response).encode())
+
+
 def daemon(mode: str = "mic") -> int:
     RUNTIME.mkdir(exist_ok=True)
     PID_FILE.write_text(f"{os.getpid()}\n")
@@ -375,6 +432,7 @@ def daemon(mode: str = "mic") -> int:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     gatt: GattSession | None = None
+    listener: socket.socket | None = None
     audio_bridge: subprocess.Popen[bytes] | None = None
     previous_sink: str | None = None
     try:
@@ -387,9 +445,11 @@ def daemon(mode: str = "mic") -> int:
             previous_sink = run_checked("pactl", "get-default-sink").stdout.strip()
         gatt = connect_gatt(ble_mac)
         audio_bridge = activate_mode(gatt, mode, live_mac, mic_source, gain)
+        listener = open_control_socket()
         print(f"Skelly {mode} mode is running", flush=True)
 
         while not stop_requested:
+            serve_control(listener, gatt)
             bridge_failed = audio_bridge is not None and audio_bridge.poll() is not None
             if bridge_failed or not bluetooth_connected(live_mac):
                 print("Skelly audio disconnected; reconnecting…", flush=True)
@@ -432,6 +492,9 @@ def daemon(mode: str = "mic") -> int:
             pass
         if gatt:
             gatt.close()
+        if listener:
+            listener.close()
+        CONTROL_SOCKET.unlink(missing_ok=True)
         PID_FILE.unlink(missing_ok=True)
         MODE_FILE.unlink(missing_ok=True)
 
