@@ -35,6 +35,8 @@ MODE_FILE = RUNTIME / "mode"
 LOG_FILE = RUNTIME / "skelly-live.log"
 CONTROL_SOCKET = RUNTIME / "control.sock"
 CONFIG_FILE = Path.home() / ".config" / "openskelly" / "config.json"
+AUDIO_RESET_COOLDOWN = 60
+AUDIO_RESET_FILE = RUNTIME / "audio-reset"
 
 
 def load_config() -> dict[str, str | float]:
@@ -298,15 +300,71 @@ def spotify_sink_input_ids(output: str) -> list[str]:
     return ids
 
 
+class AudioSinkUnavailable(RuntimeError):
+    pass
+
+
+def wait_for_audio_sink(live_mac: str, attempts: int = 30) -> None:
+    target = sink_name(live_mac)
+    for _ in range(attempts):
+        try:
+            sinks = run_checked("pactl", "list", "sinks", "short").stdout
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            sinks = ""
+        if target in sinks:
+            return
+        time.sleep(0.2)
+    raise AudioSinkUnavailable("Skelly connected, but its audio sink did not appear")
+
+
+def restart_audio_stack() -> None:
+    now = time.monotonic()
+    try:
+        last_reset = float(AUDIO_RESET_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        last_reset = float("-inf")
+    elapsed = now - last_reset
+    if 0 <= elapsed < AUDIO_RESET_COOLDOWN:
+        raise RuntimeError("PipeWire was already reset recently; refusing another reset")
+    result = subprocess.run(
+        [
+            "systemctl", "--user", "restart", "wireplumber.service",
+            "pipewire.service", "pipewire-pulse.service",
+        ],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
+    )
+    if result.returncode:
+        detail = result.stdout.strip() or f"systemctl exited with {result.returncode}"
+        raise RuntimeError(f"could not reset the PipeWire audio stack: {detail}")
+    AUDIO_RESET_FILE.write_text(f"{now}\n")
+
+
+def ensure_audio_sink(gatt: GattSession, live_mac: str) -> None:
+    try:
+        wait_for_audio_sink(live_mac)
+        return
+    except AudioSinkUnavailable:
+        print("Skelly audio sink is missing; resetting PipeWire once…", flush=True)
+
+    restart_audio_stack()
+    try:
+        # WirePlumber can often adopt the existing Bluetooth connection without
+        # another audible disconnect/reconnect cycle.
+        wait_for_audio_sink(live_mac, attempts=40)
+        return
+    except AudioSinkUnavailable:
+        pass
+
+    try:
+        run_checked("bluetoothctl", "disconnect", live_mac, timeout=10)
+    except Exception:
+        pass
+    connect_live(gatt, live_mac)
+    wait_for_audio_sink(live_mac, attempts=60)
+
+
 def route_spotify_direct(live_mac: str) -> None:
     target = sink_name(live_mac)
-    for _ in range(30):
-        sinks = run_checked("pactl", "list", "sinks", "short").stdout
-        if target in sinks:
-            break
-        time.sleep(0.2)
-    else:
-        raise RuntimeError("Skelly connected, but its audio sink did not appear")
     run_checked("pactl", "set-default-sink", target)
     inputs = run_checked("pactl", "list", "sink-inputs").stdout
     for input_id in spotify_sink_input_ids(inputs):
@@ -372,6 +430,7 @@ def activate_mode(
     gain: float,
 ) -> subprocess.Popen[bytes] | None:
     connect_live(gatt, live_mac)
+    ensure_audio_sink(gatt, live_mac)
     bridge = None
     if mode == "output":
         route_spotify_direct(live_mac)
@@ -512,7 +571,10 @@ def start(mode: str = "mic") -> int:
             stderr=log,
             start_new_session=True,
         )
-    for _ in range(60):
+    # Initial Bluetooth negotiation plus one bounded PipeWire recovery can take
+    # longer than the normal fast path. Keep this below the dashboard's 90s API
+    # timeout while allowing the daemon to report its actual outcome.
+    for _ in range(320):
         time.sleep(0.25)
         if current_pid() == proc.pid:
             text = LOG_FILE.read_text(errors="replace")

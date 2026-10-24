@@ -33,7 +33,11 @@ If discovery fails, use `configure --ble-mac AA:... --live-mac BB:...`.
 
 To route Spotify or other system audio to Skelly, use output mode. It selects
 Skelly as the default output, moves an existing Spotify stream directly to it,
-and automatically restores the Live handshake and route after a Bluetooth drop:
+and automatically restores the Live handshake and route after a Bluetooth drop.
+If Bluetooth connects but WirePlumber fails to publish the A2DP sink, OpenSkelly
+resets the user PipeWire stack once and reuses the existing connection when
+possible, avoiding an unnecessary second connection announcement. Audio-stack
+resets are rate-limited so a failing device cannot cause a restart loop:
 
 ```bash
 ./openskelly output start
